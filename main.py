@@ -3,8 +3,9 @@ from fastapi.responses import Response
 import pandas as pd
 import requests
 import zipfile
-import io
 import urllib3
+import os
+import tempfile
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -13,8 +14,8 @@ app = FastAPI()
 
 @app.get("/")
 def raiz():
-    return {"status": "API da ANEEL rodando! Acesse /dados-pb para baixar o CSV."}
-    
+    return {"status": "API da ANEEL rodando! Acesse /dados-pb para baixar o CSV da Paraíba."}
+
 @app.get("/dados-pb")
 def obter_dados_pb():
     url = "https://dadosabertos.aneel.gov.br/dataset/5e0fafd2-21b9-4d5b-b622-40438d40aba2/resource/b1bd71e7-d0ad-4214-9053-cbd58e9564a7/download/empreendimento-geracao-distribuida.zip"
@@ -25,22 +26,37 @@ def obter_dados_pb():
     session.mount('http://', adapter)
     session.mount('https://', adapter)
 
-    # Baixa em partes para evitar queda
-    response = session.get(url, verify=False, stream=True)
-    
-    zip_buffer = io.BytesIO()
-    for chunk in response.iter_content(chunk_size=8192):
-        if chunk:
-            zip_buffer.write(chunk)
+    # Cria uma pasta temporária no disco do Render para não usar a RAM
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        zip_path = os.path.join(tmpdirname, "dados.zip")
+        
+        # 1. Baixa o arquivo em partes e salva no disco
+        response = session.get(url, verify=False, stream=True)
+        with open(zip_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024): # Chunks de 1MB
+                if chunk:
+                    f.write(chunk)
+                    
+        # 2. Extrai o CSV do ZIP direto pro disco
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            nome_arquivo = z.namelist()[0]
+            csv_path = z.extract(nome_arquivo, tmpdirname)
             
-    # Extrai da memória
-    with zipfile.ZipFile(zip_buffer) as z:
-        nome_arquivo = z.namelist()[0]
-        with z.open(nome_arquivo) as f:
-            df = pd.read_csv(f, sep=';', encoding='latin1', low_memory=False)
+        # 3. Lê o CSV em pedaços pequenos (chunks) para salvar memória
+        df_pb_list = []
+        chunk_iter = pd.read_csv(csv_path, sep=';', encoding='latin1', low_memory=False, chunksize=50000)
+        
+        for chunk in chunk_iter:
+            # Filtra só a Paraíba neste pedaço pequeno e guarda
+            pb_chunk = chunk[chunk['SigUF'] == 'PB']
+            df_pb_list.append(pb_chunk)
             
-    # Filtra a Paraíba
-    df_pb = df[df['SigUF'] == 'PB']
-    csv_dados = df_pb.to_csv(index=False)
+        # 4. Junta todos os pedaços da Paraíba num arquivo só
+        df_pb_final = pd.concat(df_pb_list, ignore_index=True)
+        
+        # Transforma o resultado final em CSV de texto
+        csv_dados = df_pb_final.to_csv(index=False)
+        
+    # Quando o código sai do bloco 'with', a pasta temporária é apagada automaticamente!
     
     return Response(content=csv_dados, media_type="text/csv")
