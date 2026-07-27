@@ -11,6 +11,10 @@ from urllib3.util.retry import Retry
 urllib3.disable_warnings()
 app = FastAPI()
 
+@app.get("/")
+def raiz():
+    return {"status": "API da ANEEL rodando! Acesse /dados-pb para baixar o CSV."}
+    
 @app.get("/dados-pb")
 def obter_dados_pb():
     url = "https://dadosabertos.aneel.gov.br/dataset/5e0fafd2-21b9-4d5b-b622-40438d40aba2/resource/b1bd71e7-d0ad-4214-9053-cbd58e9564a7/download/empreendimento-geracao-distribuida.zip"
