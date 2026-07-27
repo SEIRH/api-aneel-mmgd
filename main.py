@@ -24,7 +24,7 @@ urllib3.disable_warnings()
 app = FastAPI(
     title="API ANEEL - Geração Distribuída (PB)",
     description="Filtra e consolida dados de Geração Distribuída da ANEEL para consumo no Power BI.",
-    version="1.0.0",
+    version="1.0.1", # Versão atualizada contra estouro de disco
 )
 
 # ------------------------------------------------------------------------------
@@ -53,7 +53,6 @@ def _cache_valido() -> bool:
     )
 
 def _coletar_dados_aneel() -> None:
-    """Faz o download, descompacta, filtra em pedaços e atualiza o cache."""
     erros = []
     
     session = requests.Session()
@@ -63,11 +62,10 @@ def _coletar_dados_aneel() -> None:
     session.mount('https://', adapter)
 
     try:
-        # Usa disco temporário para não estourar os 512MB de RAM do Render
         with tempfile.TemporaryDirectory() as tmpdirname:
             zip_path = os.path.join(tmpdirname, "dados.zip")
             
-            # 1. Download do ZIP em partes
+            # 1. Download do ZIP para o disco temporário (~130MB)
             response = session.get(URL_ANEEL, verify=False, stream=True, timeout=60)
             response.raise_for_status()
             
@@ -76,25 +74,25 @@ def _coletar_dados_aneel() -> None:
                     if chunk:
                         f.write(chunk)
                         
-            # 2. Extrai o arquivo
+            # 2 e 3. Lê o CSV DIRETO de dentro do ZIP, SEM extrair para o disco!
+            df_pb_list = []
             with zipfile.ZipFile(zip_path, 'r') as z:
                 nome_arquivo = z.namelist()[0]
-                csv_path = z.extract(nome_arquivo, tmpdirname)
                 
-            # 3. Lê em blocos (chunks) e filtra apenas a Paraíba
-            df_pb_list = []
-            chunk_iter = pd.read_csv(csv_path, sep=';', encoding='latin1', low_memory=False, chunksize=50000)
-            
-            for chunk in chunk_iter:
-                pb_chunk = chunk[chunk['SigUF'] == ESTADO_ALVO]
-                df_pb_list.append(pb_chunk)
+                # Abre um stream de leitura do arquivo interno
+                with z.open(nome_arquivo) as f_csv:
+                    # O Pandas vai sugando as linhas de 50k em 50k direto de dentro do ZIP
+                    chunk_iter = pd.read_csv(f_csv, sep=';', encoding='latin1', low_memory=False, chunksize=50000)
+                    
+                    for chunk in chunk_iter:
+                        pb_chunk = chunk[chunk['SigUF'] == ESTADO_ALVO]
+                        df_pb_list.append(pb_chunk)
                 
-            # 4. Consolida o resultado final
+            # 4. Consolida o resultado final (agora bem leve, só a Paraíba)
             if df_pb_list:
                 df_final = pd.concat(df_pb_list, ignore_index=True)
                 total = len(df_final)
                 
-                # Salva o CSV consolidado na memória do servidor
                 buf = io.StringIO()
                 df_final.to_csv(buf, index=False, encoding="utf-8", sep=";")
                 csv_str = buf.getvalue()
@@ -107,7 +105,7 @@ def _coletar_dados_aneel() -> None:
         total = 0
         erros.append(str(e))
 
-    # Atualiza o dicionário de cache global
+    # Atualiza cache
     if total > 0 or not _cache["csv_data"]:
         _cache["csv_data"] = csv_str
         _cache["expira_em"] = datetime.now() + timedelta(hours=CACHE_DURACAO_HORAS)
