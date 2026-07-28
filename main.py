@@ -3,18 +3,17 @@
 # ------------------------------------------------------------------------------
 # Hospedagem recomendada : Render.com (free tier)
 # Consumo no Power BI    : Web.Contents no Power Query (retorna CSV)
-# Cache                  : Em memória, expira a cada 24 horas
+# Cache                  : Em disco, expira a cada 24 horas
 # ==============================================================================
 
 from fastapi import FastAPI, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse
 import pandas as pd
 import requests
 import zipfile
 import urllib3
 import os
 import tempfile
-import io
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -24,7 +23,7 @@ urllib3.disable_warnings()
 app = FastAPI(
     title="API ANEEL - Geração Distribuída (PB)",
     description="Filtra e consolida dados de Geração Distribuída da ANEEL para consumo no Power BI.",
-    version="1.0.1", # Versão atualizada contra estouro de disco
+    version="2.0.0", # Versão otimizada para Disco e FileResponse
 )
 
 # ------------------------------------------------------------------------------
@@ -33,12 +32,12 @@ app = FastAPI(
 URL_ANEEL = "https://dadosabertos.aneel.gov.br/dataset/5e0fafd2-21b9-4d5b-b622-40438d40aba2/resource/b1bd71e7-d0ad-4214-9053-cbd58e9564a7/download/empreendimento-geracao-distribuida.zip"
 ESTADO_ALVO = "PB"
 CACHE_DURACAO_HORAS = 24
+ARQUIVO_CACHE = "mmgd_pb.csv" # Salva no disco ao invés da RAM
 
 # ------------------------------------------------------------------------------
-# Cache em memória
+# Controle de Cache
 # ------------------------------------------------------------------------------
 _cache: dict = {
-    "csv_data": None,
     "expira_em": None,
     "ultima_atualizacao": None,
     "total_registros": 0,
@@ -47,9 +46,9 @@ _cache: dict = {
 
 def _cache_valido() -> bool:
     return (
-        _cache["csv_data"] is not None
-        and _cache["expira_em"] is not None
+        _cache["expira_em"] is not None
         and datetime.now() < _cache["expira_em"]
+        and os.path.exists(ARQUIVO_CACHE)
     )
 
 def _coletar_dados_aneel() -> None:
@@ -74,40 +73,35 @@ def _coletar_dados_aneel() -> None:
                     if chunk:
                         f.write(chunk)
                         
-            # 2 e 3. Lê o CSV DIRETO de dentro do ZIP, SEM extrair para o disco!
+            # 2 e 3. Lê o CSV DIRETO de dentro do ZIP
             df_pb_list = []
             with zipfile.ZipFile(zip_path, 'r') as z:
                 nome_arquivo = z.namelist()[0]
                 
-                # Abre um stream de leitura do arquivo interno
                 with z.open(nome_arquivo) as f_csv:
-                    # O Pandas vai sugando as linhas de 50k em 50k direto de dentro do ZIP
-                    chunk_iter = pd.read_csv(f_csv, sep=';', encoding='latin1', low_memory=False, chunksize=50000)
+                    # 'utf-8' resolve melhor os caracteres novos da ANEEL do que latin1
+                    chunk_iter = pd.read_csv(f_csv, sep=';', encoding='utf-8', low_memory=False, chunksize=50000)
                     
                     for chunk in chunk_iter:
                         pb_chunk = chunk[chunk['SigUF'] == ESTADO_ALVO]
                         df_pb_list.append(pb_chunk)
                 
-            # 4. Consolida o resultado final (agora bem leve, só a Paraíba)
+            # 4. Consolida e SALVA NO DISCO
             if df_pb_list:
                 df_final = pd.concat(df_pb_list, ignore_index=True)
                 total = len(df_final)
                 
-                buf = io.StringIO()
-                df_final.to_csv(buf, index=False, encoding="utf-8", sep=";")
-                csv_str = buf.getvalue()
+                # utf-8-sig garante que o Power BI leia os acentos sem falhas
+                df_final.to_csv(ARQUIVO_CACHE, index=False, encoding="utf-8-sig", sep=";")
             else:
-                csv_str = ""
                 total = 0
 
     except Exception as e:
-        csv_str = ""
         total = 0
         erros.append(str(e))
 
     # Atualiza cache
-    if total > 0 or not _cache["csv_data"]:
-        _cache["csv_data"] = csv_str
+    if total > 0 or os.path.exists(ARQUIVO_CACHE):
         _cache["expira_em"] = datetime.now() + timedelta(hours=CACHE_DURACAO_HORAS)
         _cache["ultima_atualizacao"] = datetime.now().isoformat()
         _cache["total_registros"] = total
@@ -127,7 +121,7 @@ def raiz():
 
 @app.get(
     "/dados-pb",
-    response_class=PlainTextResponse,
+    response_class=FileResponse,
     summary="Retorna CSV consolidado da Paraíba",
     description="Use este endpoint no Power BI via Web.Contents.",
 )
@@ -135,16 +129,18 @@ def get_dados_pb():
     if not _cache_valido():
         _coletar_dados_aneel()
 
-    if not _cache["csv_data"]:
+    if not os.path.exists(ARQUIVO_CACHE):
         return Response(
             content="Nenhum dado disponível. A conexão com a ANEEL pode ter falhado.",
             status_code=503,
             media_type="text/plain",
         )
 
-    return PlainTextResponse(
-        content=_cache["csv_data"],
-        media_type="text/plain; charset=utf-8",
+    # Envia o arquivo direto do disco, desafogando a memória do servidor
+    return FileResponse(
+        path=ARQUIVO_CACHE,
+        media_type="text/csv",
+        filename="mmgd_pb.csv"
     )
 
 @app.get("/colunas", summary="Lista as colunas disponíveis no dataset")
@@ -152,10 +148,10 @@ def get_colunas():
     if not _cache_valido():
         _coletar_dados_aneel()
 
-    if not _cache["csv_data"]:
+    if not os.path.exists(ARQUIVO_CACHE):
         return Response(content="Nenhum dado disponível.", status_code=503)
 
-    df = pd.read_csv(io.StringIO(_cache["csv_data"]), sep=";", dtype=str, nrows=1)
+    df = pd.read_csv(ARQUIVO_CACHE, sep=";", dtype=str, nrows=1)
     return {"colunas": list(df.columns)}
 
 @app.get("/status", summary="Status do cache e da última coleta")
@@ -165,6 +161,7 @@ def get_status():
         "ultima_atualizacao": _cache["ultima_atualizacao"],
         "expira_em": _cache["expira_em"].isoformat() if _cache["expira_em"] else None,
         "total_registros_pb": _cache["total_registros"],
+        "tamanho_arquivo_mb": round(os.path.getsize(ARQUIVO_CACHE) / (1024 * 1024), 2) if os.path.exists(ARQUIVO_CACHE) else 0,
         "erros_na_ultima_coleta": _cache["erros"],
     }
 
