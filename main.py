@@ -79,8 +79,8 @@ def _coletar_dados_aneel() -> None:
                 nome_arquivo = z.namelist()[0]
                 
                 with z.open(nome_arquivo) as f_csv:
-                    # 'utf-8' resolve melhor os caracteres novos da ANEEL do que latin1
-                    chunk_iter = pd.read_csv(f_csv, sep=';', encoding='utf-8', low_memory=False, chunksize=50000)
+                    
+                    chunk_iter = pd.read_csv(f_csv, sep=';', encoding='latin1', low_memory=False, chunksize=50000)
                     
                     for chunk in chunk_iter:
                         pb_chunk = chunk[chunk['SigUF'] == ESTADO_ALVO]
